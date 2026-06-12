@@ -1,3 +1,6 @@
+-- [MANDATORY] Connected Discord-GitHub
+-- This script implements an advanced, OOP-based Grid Placement System.
+-- It handles strict spatial queries, normal-based rotation alignment, grid math, and visual interpolation.
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -5,240 +8,309 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local SoundService = game:GetService("SoundService")
 local PlaceBlockEvent = ReplicatedStorage:WaitForChild("PlaceBlockEvent")
-local Tool = script.Parent
-local Player = Players.LocalPlayer
-local Camera = workspace.CurrentCamera
-local Character = Player.Character or Player.CharacterAdded:Wait()
-local RootPart = Character:WaitForChild("HumanoidRootPart")
-local Configuration = {}
-Configuration.GridSize = 3
-Configuration.MaxDistance = 18
-Configuration.DepthSearch = -10
-Configuration.Cooldown = 0.1
-Configuration.GhostAlpha = 0.6
-Configuration.GhostValidColor = Color3.fromRGB(100, 255, 100)
-Configuration.GhostInvalidColor = Color3.fromRGB(255, 100, 100)
-Configuration.LerpSpeed = 25
-local CurrentState = {}
-CurrentState.LastPlaceTime = 0
-CurrentState.PendingPosition = nil
-CurrentState.IsPlacementValid = false
-CurrentState.RotationAngle = 0
-CurrentState.ActiveConnections = {}
-local PlacementSound = Instance.new("Sound")
-PlacementSound.SoundId = "rbxassetid://876939830"
-PlacementSound.Volume = 0.5
-PlacementSound.Parent = Tool
-local function CreateRaycastFilter()
-local filter = RaycastParams.new()
-filter.FilterType = Enum.RaycastFilterType.Exclude
-filter.FilterDescendantsInstances = {Character}
-filter.IgnoreWater = true
-return filter
+type PlacementConfig = {
+    GridSize: number,
+    MaxPlacementRange: number,
+    RotationSnapAngle: number,
+    GhostOpacity: number,
+    ColorValid: Color3,
+    ColorInvalid: Color3,
+    MaxSlopeAngle: number,
+    LerpSmoothing: number,
+    CooldownTime: number
+}
+local Config: PlacementConfig = {
+    GridSize = 3,
+    MaxPlacementRange = 25,
+    RotationSnapAngle = 90,
+    GhostOpacity = 0.6,
+    ColorValid = Color3.fromRGB(80, 255, 80),
+    ColorInvalid = Color3.fromRGB(255, 80, 80),
+    MaxSlopeAngle = 50,
+    LerpSmoothing = 0.35,
+    CooldownTime = 0.15
+}
+local GridMathUtility = {}
+function GridMathUtility.SnapAxis(value: number, step: number): number
+    local divided = value / step
+    local rounded = math.floor(divided + 0.5)
+    return rounded * step
 end
-local function CreateOverlapFilter()
-local filter = OverlapParams.new()
-filter.FilterType = Enum.RaycastFilterType.Exclude
-filter.FilterDescendantsInstances = {Character}
-filter.MaxParts = 100
-return filter
+function GridMathUtility.SnapPosition(position: Vector3, step: number): Vector3
+    local snappedX = GridMathUtility.SnapAxis(position.X, step)
+    local snappedY = GridMathUtility.SnapAxis(position.Y, step)
+    local snappedZ = GridMathUtility.SnapAxis(position.Z, step)
+    return Vector3.new(snappedX, snappedY, snappedZ)
 end
-local PrimaryRaycastFilter = CreateRaycastFilter()
-local PrimaryOverlapFilter = CreateOverlapFilter()
-local function GetSnappedCoordinate(value)
-local scaledValue = value / Configuration.GridSize
-local roundedValue = math.floor(scaledValue + 0.5)
-return roundedValue * Configuration.GridSize
+function GridMathUtility.GetSurfaceAlignment(surfaceNormal: Vector3): CFrame
+    local globalUp = Vector3.new(0, 1, 0)
+    local dotProduct = math.abs(surfaceNormal:Dot(globalUp))
+    if dotProduct > 0.999 then
+        return CFrame.new()
+    end
+    local rightAxis = globalUp:Cross(surfaceNormal).Unit
+    local alignedUp = surfaceNormal:Cross(rightAxis).Unit
+    return CFrame.fromMatrix(Vector3.zero, rightAxis, alignedUp, surfaceNormal)
 end
-local function SnapVectorToGrid(vector)
-local snapX = GetSnappedCoordinate(vector.X)
-local snapY = GetSnappedCoordinate(vector.Y)
-local snapZ = GetSnappedCoordinate(vector.Z)
-return Vector3.new(snapX, snapY, snapZ)
+local EffectManager = {}
+function EffectManager.CreatePlacementSound(parentInstance: Instance): Sound
+    local sound = Instance.new("Sound")
+    sound.SoundId = "rbxassetid://876939830"
+    sound.Volume = 0.6
+    sound.Pitch = 1.1
+    sound.RollOffMaxDistance = 50
+    sound.RollOffMinDistance = 10
+    sound.Parent = parentInstance
+    return sound
 end
-local function ValidatePlacementArea(targetPosition)
-local targetCFrame = CFrame.new(targetPosition)
-local tolerance = Vector3.new(0.1, 0.1, 0.1)
-local blockSize = Vector3.one * Configuration.GridSize
-local searchBounds = blockSize - tolerance
-local intersectingParts = workspace:GetPartBoundsInBox(targetCFrame, searchBounds, PrimaryOverlapFilter)
-return #intersectingParts == 0
+function EffectManager.CreateErrorSound(parentInstance: Instance): Sound
+    local sound = Instance.new("Sound")
+    sound.SoundId = "rbxassetid://235040113"
+    sound.Volume = 0.4
+    sound.Pitch = 0.9
+    sound.Parent = parentInstance
+    return sound
 end
-local function InitializeGhostPart()
-local part = Instance.new("Part")
-part.Name = "PlacementGhost"
-part.Anchored = true
-part.CanCollide = false
-part.CanQuery = false
-part.CanTouch = false
-part.CastShadow = false
-part.Size = Vector3.one * Configuration.GridSize
-part.Material = Enum.Material.SmoothPlastic
-part.Transparency = Configuration.GhostAlpha
-local highlight = Instance.new("SelectionBox")
-highlight.Adornee = part
-highlight.LineThickness = 0.04
-highlight.Color3 = Color3.new(1, 1, 1)
-highlight.Parent = part
-return part
+function EffectManager.PlayPopEffect(originCFrame: CFrame, size: Vector3)
+    local effectPart = Instance.new("Part")
+    effectPart.Anchored = true
+    effectPart.CanCollide = false
+    effectPart.CanQuery = false
+    effectPart.Size = size
+    effectPart.CFrame = originCFrame
+    effectPart.Material = Enum.Material.ForceField
+    effectPart.Color = Color3.new(1, 1, 1)
+    effectPart.Parent = workspace
+    local tweenInfo = TweenInfo.new(0.4, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out)
+    local properties = {
+        Size = size * 1.5,
+        Transparency = 1
+    }
+    local tween = TweenService:Create(effectPart, tweenInfo, properties)
+    tween:Play()
+    tween.Completed:Connect(function()
+        effectPart:Destroy()
+    end)
 end
-local GhostInstance = InitializeGhostPart()
-local function UpdateGhostAppearance(targetPosition, deltaTime)
-if not GhostInstance.Parent then
-GhostInstance.Parent = workspace
-GhostInstance.Position = targetPosition
+local PlacementController = {}
+PlacementController.__index = PlacementController
+function PlacementController.new(tool: Tool)
+    local self = setmetatable({}, PlacementController)
+    self.ToolInstance = tool
+    self.LocalPlayer = Players.LocalPlayer
+    self.MainCamera = workspace.CurrentCamera
+    self.Character = self.LocalPlayer.Character or self.LocalPlayer.CharacterAdded:Wait()
+    self.RootPart = self.Character:WaitForChild("HumanoidRootPart")
+    self.Humanoid = self.Character:WaitForChild("Humanoid")
+    self.SpatialRayParams = RaycastParams.new()
+    self.SpatialRayParams.FilterType = Enum.RaycastFilterType.Exclude
+    self.SpatialRayParams.FilterDescendantsInstances = {self.Character}
+    self.SpatialRayParams.IgnoreWater = true
+    self.SpatialOverlapParams = OverlapParams.new()
+    self.SpatialOverlapParams.FilterType = Enum.RaycastFilterType.Exclude
+    self.SpatialOverlapParams.FilterDescendantsInstances = {self.Character}
+    self.SpatialOverlapParams.MaxParts = 50
+    self.RotationState = 0
+    self.SystemActive = false
+    self.IsPositionValid = false
+    self.CalculatedCFrame = CFrame.new()
+    self.LastInteractionTime = 0
+    self.EventConnections = {}
+    self.PlaceSound = EffectManager.CreatePlacementSound(self.ToolInstance)
+    self.ErrorSound = EffectManager.CreateErrorSound(self.ToolInstance)
+    self:InitializeGhostBlock()
+    return self
 end
-local rotationMatrix = CFrame.Angles(0, math.rad(CurrentState.RotationAngle), 0)
-local targetCFrame = CFrame.new(targetPosition) * rotationMatrix
-GhostInstance.CFrame = GhostInstance.CFrame:Lerp(targetCFrame, math.min(1, deltaTime * Configuration.LerpSpeed))
-if CurrentState.IsPlacementValid then
-GhostInstance.Color = Configuration.GhostValidColor
-else
-GhostInstance.Color = Configuration.GhostInvalidColor
+function PlacementController:InitializeGhostBlock()
+    self.GhostBlock = Instance.new("Part")
+    self.GhostBlock.Name = "PlacementPreview"
+    self.GhostBlock.Anchored = true
+    self.GhostBlock.CanCollide = false
+    self.GhostBlock.CanQuery = false
+    self.GhostBlock.CanTouch = false
+    self.GhostBlock.CastShadow = false
+    self.GhostBlock.Size = Vector3.new(Config.GridSize, Config.GridSize, Config.GridSize)
+    self.GhostBlock.Transparency = Config.GhostOpacity
+    self.GhostBlock.Material = Enum.Material.SmoothPlastic
+    self.GhostBox = Instance.new("SelectionBox")
+    self.GhostBox.Adornee = self.GhostBlock
+    self.GhostBox.LineThickness = 0.03
+    self.GhostBox.Color3 = Color3.new(1, 1, 1)
+    self.GhostBox.Parent = self.GhostBlock
 end
+function PlacementController:CastScreenRay()
+    local mouseLocation = UserInputService:GetMouseLocation()
+    local screenRay = self.MainCamera:ViewportPointToRay(mouseLocation.X, mouseLocation.Y)
+    local rootDistance = (self.RootPart.Position - screenRay.Origin).Magnitude
+    local maximumRayLength = rootDistance + Config.MaxPlacementRange
+    local rayDirection = screenRay.Direction * maximumRayLength
+    local rayResult = workspace:Raycast(screenRay.Origin, rayDirection, self.SpatialRayParams)
+    return rayResult, screenRay
 end
-local function HideGhostVisuals()
-GhostInstance.Parent = nil
+function PlacementController:CheckBoundingIntersections(targetCFrame: CFrame): boolean
+    local sizeReduction = 0.15
+    local boundsVector = Vector3.new(
+        Config.GridSize - sizeReduction,
+        Config.GridSize - sizeReduction,
+        Config.GridSize - sizeReduction
+    )
+    local intersectingParts = workspace:GetPartBoundsInBox(targetCFrame, boundsVector, self.SpatialOverlapParams)
+    local intersectionCount = #intersectingParts
+    if intersectionCount > 0 then
+        return false
+    end
+    return true
 end
-local function FindAnchorFromGround(origin)
-local downwardVector = Vector3.new(0, Configuration.DepthSearch, 0)
-local result = workspace:Raycast(origin, downwardVector, PrimaryRaycastFilter)
-if not result then
-return nil
+function PlacementController:EvaluateSurfaceSlope(surfaceNormal: Vector3): boolean
+    local globalUpVector = Vector3.new(0, 1, 0)
+    local dotProductValue = surfaceNormal:Dot(globalUpVector)
+    local clampedDot = math.clamp(dotProductValue, -1, 1)
+    local angleInDegrees = math.deg(math.acos(clampedDot))
+    local isValidSlope = angleInDegrees <= Config.MaxSlopeAngle
+    local isValidCeiling = angleInDegrees >= (180 - Config.MaxSlopeAngle)
+    return isValidSlope or isValidCeiling
 end
-local offsetNormal = result.Normal * (Configuration.GridSize * 0.5)
-return SnapVectorToGrid(result.Position - offsetNormal)
+function PlacementController:DeterminePlacementCFrame(raycastResult: RaycastResult?, fallbackScreenRay: Ray)
+    local originPosition = Vector3.zero
+    local finalSurfaceNormal = Vector3.new(0, 1, 0)
+    if raycastResult then
+        local gridHalfOffset = Config.GridSize * 0.5
+        local positionalOffset = raycastResult.Normal * gridHalfOffset
+        originPosition = raycastResult.Position + positionalOffset
+        finalSurfaceNormal = raycastResult.Normal
+    else
+        local horizontalDirection = fallbackScreenRay.Direction * Vector3.new(1, 0, 1)
+        local horizontalMagnitude = horizontalDirection.Magnitude
+        if horizontalMagnitude < 0.001 then
+            local characterLook = self.RootPart.CFrame.LookVector
+            horizontalDirection = characterLook * Vector3.new(1, 0, 1)
+        end
+        local normalizedHorizontal = horizontalDirection.Unit
+        originPosition = self.RootPart.Position + (normalizedHorizontal * Config.MaxPlacementRange)
+    end
+    local snappedCoordinates = GridMathUtility.SnapPosition(originPosition, Config.GridSize)
+    local orientationCFrame = GridMathUtility.GetSurfaceAlignment(finalSurfaceNormal)
+    local rotationRadians = math.rad(self.RotationState)
+    local userRotationCFrame = CFrame.Angles(0, rotationRadians, 0)
+    local finalPositionCFrame = CFrame.new(snappedCoordinates)
+    return finalPositionCFrame * orientationCFrame * userRotationCFrame, finalSurfaceNormal
 end
-local function FindAnchorFromEnvironment(origin)
-local parts = workspace:GetPartBoundsInRadius(origin, Configuration.MaxDistance, PrimaryOverlapFilter)
-local closestAnchor = nil
-local minDistance = math.huge
-for index, part in ipairs(parts) do
-local dist = (part.Position - origin).Magnitude
-if dist < minDistance then
-minDistance = dist
-closestAnchor = SnapVectorToGrid(part.Position)
+function PlacementController:UpdateRenderCycle()
+    if not self.SystemActive then
+        return
+    end
+    if self.Humanoid.Health <= 0 then
+        self:DeactivateSystem()
+        return
+    end
+    local castResult, viewportRay = self:CastScreenRay()
+    local targetCFrame, hitNormal = self:DeterminePlacementCFrame(castResult, viewportRay)
+    self.CalculatedCFrame = targetCFrame
+    local clearanceCheck = self:CheckBoundingIntersections(self.CalculatedCFrame)
+    local slopeCheck = self:EvaluateSurfaceSlope(hitNormal)
+    local distanceMagnitude = (self.CalculatedCFrame.Position - self.RootPart.Position).Magnitude
+    local distanceCheck = distanceMagnitude <= Config.MaxPlacementRange
+    self.IsPositionValid = clearanceCheck and slopeCheck and distanceCheck
+    local isGhostParented = self.GhostBlock.Parent ~= nil
+    if not isGhostParented then
+        self.GhostBlock.Parent = workspace
+    end
+    self.GhostBlock.CFrame = self.GhostBlock.CFrame:Lerp(self.CalculatedCFrame, Config.LerpSmoothing)
+    if self.IsPositionValid then
+        self.GhostBlock.Color = Config.ColorValid
+    else
+        self.GhostBlock.Color = Config.ColorInvalid
+    end
 end
+function PlacementController:ProcessServerPlacement()
+    if not self.SystemActive then
+        return
+    end
+    if not self.IsPositionValid then
+        self.ErrorSound:Play()
+        return
+    end
+    local currentTime = os.clock()
+    local timeDifference = currentTime - self.LastInteractionTime
+    if timeDifference < Config.CooldownTime then
+        return
+    end
+    self.LastInteractionTime = currentTime
+    self.PlaceSound:Play()
+    EffectManager.PlayPopEffect(self.CalculatedCFrame, self.GhostBlock.Size)
+    PlaceBlockEvent:InvokeServer(self.CalculatedCFrame)
 end
-return closestAnchor
+function PlacementController:ParseKeyboardInputs(inputObject: InputObject, eventProcessed: boolean)
+    if eventProcessed then
+        return
+    end
+    if not self.SystemActive then
+        return
+    end
+    local inputState = inputObject.UserInputState
+    if inputState ~= Enum.UserInputState.Begin then
+        return
+    end
+    local inputKey = inputObject.KeyCode
+    if inputKey == Enum.KeyCode.R then
+        self.RotationState = (self.RotationState + Config.RotationSnapAngle) % 360
+    elseif inputKey == Enum.KeyCode.F then
+        self.RotationState = (self.RotationState - Config.RotationSnapAngle) % 360
+    end
 end
-local function ResolvePlacementPosition(mouseHit, mouseRay)
-local rootPosition = RootPart.Position
-if mouseHit then
-local normalOffset = mouseHit.Normal * (Configuration.GridSize * 0.5)
-return SnapVectorToGrid(mouseHit.Position + normalOffset)
+function PlacementController:ParseMouseInputs(inputObject: InputObject, eventProcessed: boolean)
+    if eventProcessed then
+        return
+    end
+    if not self.SystemActive then
+        return
+    end
+    local inputType = inputObject.UserInputType
+    local isMouseClick = inputType == Enum.UserInputType.MouseButton1
+    local isScreenTouch = inputType == Enum.UserInputType.Touch
+    if not (isMouseClick or isScreenTouch) then
+        return
+    end
+    local inputState = inputObject.UserInputState
+    if inputState == Enum.UserInputState.Begin then
+        self:ProcessServerPlacement()
+    end
 end
-local validAnchor = FindAnchorFromGround(rootPosition) or FindAnchorFromEnvironment(rootPosition)
-if not validAnchor then
-return nil
+function PlacementController:ActivateSystem()
+    self.SystemActive = true
+    self.RotationState = 0
+    local renderConnection = RunService.RenderStepped:Connect(function()
+        self:UpdateRenderCycle()
+    end)
+    self.EventConnections["RenderStep"] = renderConnection
+    local keyboardConnection = UserInputService.InputBegan:Connect(function(input, processed)
+        self:ParseKeyboardInputs(input, processed)
+    end)
+    self.EventConnections["KeyboardBegan"] = keyboardConnection
+    local mouseConnection = UserInputService.InputBegan:Connect(function(input, processed)
+        self:ParseMouseInputs(input, processed)
+    end)
+    self.EventConnections["MouseBegan"] = mouseConnection
 end
-local rayDir = mouseRay.Direction
-if math.abs(rayDir.Y) < 0.001 then
-return nil
+function PlacementController:DeactivateSystem()
+    self.SystemActive = false
+    for connectionName, activeConnection in pairs(self.EventConnections) do
+        if activeConnection.Connected then
+            activeConnection:Disconnect()
+        end
+    end
+    table.clear(self.EventConnections)
+    self.IsPositionValid = false
+    self.RotationState = 0
+    if self.GhostBlock and self.GhostBlock.Parent then
+        self.GhostBlock.Parent = nil
+    end
 end
-local planeDistance = (validAnchor.Y - mouseRay.Origin.Y) / rayDir.Y
-local projectedHit = mouseRay.Origin + (rayDir * planeDistance)
-local planarDifference = (projectedHit - rootPosition) * Vector3.new(1, 0, 1)
-if planarDifference.Magnitude < 0.001 then
-return nil
-end
-local placementDirection = planarDifference.Unit
-local maxIterations = math.floor(Configuration.MaxDistance / Configuration.GridSize)
-for stepIndex = 1, maxIterations do
-local stepOffset = placementDirection * (Configuration.GridSize * stepIndex)
-local candidatePosition = SnapVectorToGrid(validAnchor + stepOffset)
-local distanceFromRoot = (candidatePosition - rootPosition).Magnitude
-if distanceFromRoot > Configuration.MaxDistance then
-break
-end
-if ValidatePlacementArea(candidatePosition) then
-return candidatePosition
-end
-end
-return nil
-end
-local function CastViewportRay()
-local mousePos = UserInputService:GetMouseLocation()
-local viewportRay = Camera:ViewportPointToRay(mousePos.X, mousePos.Y)
-local distanceToRoot = (RootPart.Position - viewportRay.Origin).Magnitude
-local rayDistance = distanceToRoot + Configuration.MaxDistance
-local result = workspace:Raycast(viewportRay.Origin, viewportRay.Direction * rayDistance, PrimaryRaycastFilter)
-return result, viewportRay
-end
-local function TriggerBlockPlacement()
-if not CurrentState.PendingPosition then
-return
-end
-if not CurrentState.IsPlacementValid then
-return
-end
-local timeNow = os.clock()
-if timeNow - CurrentState.LastPlaceTime < Configuration.Cooldown then
-return
-end
-CurrentState.LastPlaceTime = timeNow
-PlacementSound:Play()
-local finalCFrame = CFrame.new(CurrentState.PendingPosition) * CFrame.Angles(0, math.rad(CurrentState.RotationAngle), 0)
-PlaceBlockEvent:InvokeServer(finalCFrame)
-end
-local function ProcessKeyboardInput(input, processed)
-if processed then
-return
-end
-if input.UserInputState ~= Enum.UserInputState.Begin then
-return
-end
-if input.KeyCode == Enum.KeyCode.R then
-CurrentState.RotationAngle = (CurrentState.RotationAngle + 90) % 360
-end
-end
-local function ProcessMouseInput(input, processed)
-if processed then
-return
-end
-if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then
-return
-end
-if input.UserInputState == Enum.UserInputState.Begin then
-TriggerBlockPlacement()
-end
-end
-local function ClearToolConnections()
-for key, connection in pairs(CurrentState.ActiveConnections) do
-if connection then
-connection:Disconnect()
-end
-end
-table.clear(CurrentState.ActiveConnections)
-end
-local function ExecuteRenderStep(deltaTime)
-local hitResult, rayResult = CastViewportRay()
-local targetPosition = ResolvePlacementPosition(hitResult, rayResult)
-CurrentState.PendingPosition = targetPosition
-if not targetPosition then
-HideGhostVisuals()
-CurrentState.IsPlacementValid = false
-return
-end
-local visualPosition = targetPosition
-if hitResult then
-visualPosition = visualPosition - (hitResult.Normal * Configuration.GridSize)
-end
-CurrentState.IsPlacementValid = ValidatePlacementArea(targetPosition)
-UpdateGhostAppearance(visualPosition, deltaTime)
-end
-local function HandleToolEquip()
-CurrentState.ActiveConnections.RenderUpdate = RunService.RenderStepped:Connect(ExecuteRenderStep)
-CurrentState.ActiveConnections.MouseClick = UserInputService.InputBegan:Connect(ProcessMouseInput)
-CurrentState.ActiveConnections.KeyPress = UserInputService.InputBegan:Connect(ProcessKeyboardInput)
-CurrentState.RotationAngle = 0
-end
-local function HandleToolUnequip()
-ClearToolConnections()
-CurrentState.PendingPosition = nil
-CurrentState.IsPlacementValid = false
-CurrentState.RotationAngle = 0
-HideGhostVisuals()
-end
-Tool.Equipped:Connect(HandleToolEquip)
-Tool.Unequipped:Connect(HandleToolUnequip)
+local PrimaryTool = script.Parent
+local MasterController = PlacementController.new(PrimaryTool)
+PrimaryTool.Equipped:Connect(function()
+    MasterController:ActivateSystem()
+end)
+PrimaryTool.Unequipped:Connect(function()
+    MasterController:DeactivateSystem()
+end)
